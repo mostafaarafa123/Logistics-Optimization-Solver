@@ -1,8 +1,3 @@
-
-"""
-Contestant solver for the Robin Logistics Environment.
-PHASE 9: Optimal Routing (Nearest Neighbor) & Smart Batching
-"""
 from robin_logistics import LogisticsEnvironment
 from typing import Dict, List, Optional, Set
 
@@ -88,7 +83,7 @@ def my_solver(env) -> Dict:
 
     solution = {"routes": []}
 
-    print("--- 🚀 Starting Phase 9 Solver (NN Routing + Smart Batching) ---")
+    print("---  Starting Phase 9 Solver (NN Routing + Smart Batching) ---")
 
     # 1. Get Road Network Data
     try:
@@ -330,7 +325,7 @@ def my_solver(env) -> Dict:
                 else:
                     local_inventory[wh_id][sku_id] = quantity
 
-    print(f"\n--- 🚀 Phase 9 Finished ---")
+    print(f"\n---  Phase 9 Finished ---")
     print(f"Total routes created: {len(solution['routes'])}")
     print(f"Orders left unassigned: {len(unassigned_orders)}")
 
