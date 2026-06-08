@@ -1,356 +1,382 @@
-import math
-import random
+
 from robin_logistics import LogisticsEnvironment
-from typing import Dict, List, Optional, Set, Tuple
-
-# -----------------------------------------------------------------
-# 1. PATH CACHING HELPERS (FOR SPEED)
-# -----------------------------------------------------------------
-# Global cache to store all paths.
-# all_paths_cache[start_node][end_node] = (distance, [path_list])
-all_paths_cache: Dict[int, Dict[int, Tuple[int, List[int]]]] = {}
+from typing import Dict, List, Optional, Tuple
 
 
-def pre_calculate_all_paths(adj_list: Dict[int, List[int]]):
+def find_shortest_path(adj_list: Dict[int, List[int]], start_node: int, end_node: int) -> Optional[List[int]]:
     """
-    Fills the global `all_paths_cache` with all-pairs shortest paths using BFS
-    from every single node. This is the key to handling 500+ orders.
+    Find shortest path between two nodes using BFS.
+    Returns list of node IDs or None if no path exists.
     """
-    global all_paths_cache
-    all_paths_cache = {}
-    all_nodes = list(adj_list.keys())
+    if start_node == end_node:
+        return [start_node]
 
-    print(f"Pre-calculating all-pairs shortest paths for {len(all_nodes)} nodes...")
+    queue = [(start_node, [start_node])]
+    visited = {start_node}
 
-    for start_node in all_nodes:
-        all_paths_cache[start_node] = {}
-        queue = [(start_node, [start_node])]
-        visited = {start_node}
-        all_paths_cache[start_node][start_node] = (0, [start_node])
+    while queue:
+        current_node, path = queue.pop(0)
 
-        while queue:
-            (current_node, path) = queue.pop(0)
-            if current_node not in adj_list: continue
-            for neighbor in adj_list[current_node]:
-                if neighbor not in visited:
-                    visited.add(neighbor)
-                    new_path = path + [neighbor]
-                    distance = len(new_path) - 1
-                    all_paths_cache[start_node][neighbor] = (distance, new_path)
-                    queue.append((neighbor, new_path))
-    print("... Pre-calculation complete.")
+        if current_node not in adj_list:
+            continue
+
+        for neighbor in adj_list[current_node]:
+            if neighbor not in visited:
+                visited.add(neighbor)
+                new_path = path + [neighbor]
+
+                if neighbor == end_node:
+                    return new_path
+
+                queue.append((neighbor, new_path))
+
+    return None
 
 
-def get_path_from_cache(start_node: int, end_node: int) -> Optional[List[int]]:
+def calculate_path_length(adj_list: Dict[int, List[int]], start: int, end: int) -> float:
+    """Calculate shortest path length between nodes. Returns inf if no path."""
+    path = find_shortest_path(adj_list, start, end)
+    return len(path) - 1 if path else float('inf')
+
+
+def find_optimal_warehouse_for_order(env, order_id: int, local_inventory: Dict,
+                                     adj_list: Dict) -> Tuple[float, Optional[int]]:
+    """
+    Find the closest warehouse that can fulfill the entire order.
+    Returns: (distance_to_order, warehouse_id) or (inf, None)
+    """
+    requirements = env.get_order_requirements(order_id)
+    dest_node = env.get_order_location(order_id)
+
+    candidates = []
+
+    for wh_id, inventory in local_inventory.items():
+        # Check if this warehouse can fulfill all SKUs
+        can_fulfill = all(
+            inventory.get(sku_id, 0) >= quantity
+            for sku_id, quantity in requirements.items()
+        )
+
+        if can_fulfill:
+            wh_node = env.get_warehouse_by_id(wh_id).location.id
+            distance = calculate_path_length(adj_list, wh_node, dest_node)
+            candidates.append((distance, wh_id))
+
+    if not candidates:
+        return (float('inf'), None)
+
+    candidates.sort()
+    return candidates[0]
+
+
+def compute_order_profile(env, order_id: int, local_inventory: Dict,
+                          adj_list: Dict, vehicle_home_node: int) -> Optional[Dict]:
+    """
+    Compute comprehensive metrics for an order including weight, volume,
+    optimal warehouse, and routing efficiency.
+    """
     try:
-        return all_paths_cache[start_node][end_node][1]  # Path list
-    except KeyError:
+        requirements = env.get_order_requirements(order_id)
+        dest_node = env.get_order_location(order_id)
+
+        # Calculate cargo metrics
+        total_weight = 0
+        total_volume = 0
+
+        for sku_id, quantity in requirements.items():
+            sku_details = env.get_sku_details(sku_id)
+            total_weight += sku_details['weight'] * quantity
+            total_volume += sku_details['volume'] * quantity
+
+        # Find optimal warehouse
+        dist_to_dest, best_wh_id = find_optimal_warehouse_for_order(
+            env, order_id, local_inventory, adj_list
+        )
+
+        if best_wh_id is None:
+            return None
+
+        wh_node = env.get_warehouse_by_id(best_wh_id).location.id
+
+        # Calculate routing metrics
+        dist_vehicle_to_wh = calculate_path_length(adj_list, vehicle_home_node, wh_node)
+        total_route_dist = dist_vehicle_to_wh + dist_to_dest
+
+        # Efficiency: lower is better (distance per unit cargo)
+        cargo_units = max(total_weight, 1)
+        efficiency = total_route_dist / cargo_units
+
+        return {
+            'order_id': order_id,
+            'weight': total_weight,
+            'volume': total_volume,
+            'best_warehouse_id': best_wh_id,
+            'warehouse_node': wh_node,
+            'destination_node': dest_node,
+            'dist_wh_to_dest': dist_to_dest,
+            'total_route_distance': total_route_dist,
+            'requirements': requirements,
+            'efficiency_score': efficiency
+        }
+    except Exception:
         return None
 
 
-def get_dist_from_cache(start_node: int, end_node: int) -> float:
-    try:
-        return float(all_paths_cache[start_node][end_node][0])  # Distance
-    except KeyError:
-        return float('inf')
-
-
-def find_nearest_node_fast(current_node: int, target_nodes: Set[int]) -> Optional[int]:
-    """Finds the nearest node from a set using the pre-computed cache (O(N) lookup)."""
-    if not target_nodes: return None
-    min_dist = float('inf')
-    best_target = None
-    for target in target_nodes:
-        dist = get_dist_from_cache(current_node, target)
-        if dist < min_dist:
-            min_dist = dist
-            best_target = target
-    return best_target
-
-
-# -----------------------------------------------------------------
-# 2. SIMULATED ANNEALING (SA) OPTIMIZER (FOR GLOBAL BEST PATH)
-# -----------------------------------------------------------------
-
-def get_tour_cost(tour: List[int]) -> float:
-    """Calculates the total distance (cost) of a given tour list."""
-    if not tour: return 0.0
-    cost = 0.0
-    for i in range(len(tour) - 1):
-        cost += get_dist_from_cache(tour[i], tour[i + 1])
-    return cost
-
-
-def get_neighbor_solution(tour: List[int]) -> List[int]:
+def select_orders_knapsack(vehicle, order_profiles: List[Dict],
+                           local_inventory: Dict) -> List[Dict]:
     """
-    Creates a new "neighbor" tour by performing a 2-Opt swap.
-    It picks two random indices (i, k) and reverses the segment between them.
+    Select optimal subset of orders for vehicle using greedy knapsack approach.
+    Prioritizes efficiency while respecting capacity constraints.
     """
-    if len(tour) < 4:  # Need at least 4 nodes to swap (e.g., [start, A, B, end])
-        return tour[:]
+    # Sort by efficiency (lower distance per cargo unit is better)
+    sorted_profiles = sorted(order_profiles, key=lambda x: x['efficiency_score'])
 
-    # Get two random, distinct indices, ensuring i < k
-    # We don't swap the start (0) or end (last) nodes
-    i, k = random.sample(range(1, len(tour) - 1), 2)
-    if i > k:
-        i, k = k, i
+    selected = []
+    cumulative_weight = 0
+    cumulative_volume = 0
 
-    new_tour = tour[:i]  # Segment 1
-    new_tour.extend(reversed(tour[i:k + 1]))  # Segment 2 (Reversed)
-    new_tour.extend(tour[k + 1:])  # Segment 3
+    for profile in sorted_profiles:
+        # Check capacity feasibility
+        if (cumulative_weight + profile['weight'] <= vehicle.capacity_weight and
+                cumulative_volume + profile['volume'] <= vehicle.capacity_volume):
 
-    return new_tour
+            # Verify inventory availability
+            wh_id = profile['best_warehouse_id']
+            inventory_available = all(
+                local_inventory[wh_id].get(sku_id, 0) >= qty
+                for sku_id, qty in profile['requirements'].items()
+            )
+
+            if inventory_available:
+                selected.append(profile)
+                cumulative_weight += profile['weight']
+                cumulative_volume += profile['volume']
+
+    return selected
 
 
-def optimize_route_simulated_annealing(start_node: int, tour: List[int], end_node: int) -> List[int]:
+def build_route_for_batch(env, vehicle_id: int, selected_orders: List[Dict],
+                          adj_list: Dict) -> Dict:
     """
-    Improves a given tour (list of node IDs) using Simulated Annealing.
-    This is the "globally optimal" algorithm you requested.
+    Construct a complete route with pickups and deliveries for selected orders.
     """
-    if not tour:
-        return []
+    vehicle_home_node = env.get_vehicle_home_warehouse(vehicle_id)
 
-    # 1. Parameters
-    initial_temp = 100.0  # Starting temperature
-    min_temp = 0.1  # Ending temperature
-    cooling_rate = 0.995  # Rate to cool down (e.g., 0.995 is slow and good)
+    # Initialize route
+    all_steps = [{
+        'node_id': vehicle_home_node,
+        'pickups': [],
+        'deliveries': [],
+        'unloads': []
+    }]
+    current_node = vehicle_home_node
 
-    # 2. Create initial state
-    full_tour = [start_node] + tour + [end_node]
+    # Group pickups by warehouse node - ensure no duplicates
+    pickups_by_node = {}
+    for order in selected_orders:
+        wh_id = order['best_warehouse_id']
+        wh_node = order['warehouse_node']
 
-    current_solution = full_tour
-    current_cost = get_tour_cost(current_solution)
+        if wh_node not in pickups_by_node:
+            pickups_by_node[wh_node] = []
 
-    best_solution = current_solution[:]
-    best_cost = current_cost
+        # Add each SKU pickup for this order
+        for sku_id, quantity in order['requirements'].items():
+            pickups_by_node[wh_node].append({
+                'warehouse_id': wh_id,
+                'sku_id': sku_id,
+                'quantity': quantity
+            })
 
-    temp = initial_temp
+    # Group deliveries by destination node - ensure complete orders
+    deliveries_by_node = {}
+    for order in selected_orders:
+        dest_node = order['destination_node']
+        order_id = order['order_id']
 
-    # 3. Main Optimization Loop
-    while temp > min_temp:
-        # Create a new solution by slightly modifying the current one
-        new_solution = get_neighbor_solution(current_solution)
-        new_cost = get_tour_cost(new_solution)
+        if dest_node not in deliveries_by_node:
+            deliveries_by_node[dest_node] = []
 
-        # Calculate the energy difference
-        cost_diff = new_cost - current_cost
+        # Add all SKUs for this order together
+        for sku_id, quantity in order['requirements'].items():
+            deliveries_by_node[dest_node].append({
+                'order_id': order_id,
+                'sku_id': sku_id,
+                'quantity': quantity
+            })
 
-        # 4. Decision Logic (The Core)
-        if cost_diff < 0:
-            # New solution is better, always accept it
-            current_solution = new_solution
-            current_cost = new_cost
-            if new_cost < best_cost:
-                best_solution = new_solution[:]
-                best_cost = new_cost
-        else:
-            # New solution is worse.
-            # Accept it based on probability to "escape" local optima
-            acceptance_probability = math.exp(-cost_diff / temp)
-            if random.random() < acceptance_probability:
-                current_solution = new_solution
-                current_cost = new_cost
+    # Execute pickups
+    for wh_node, pickup_actions in pickups_by_node.items():
+        if wh_node != current_node:
+            path = find_shortest_path(adj_list, current_node, wh_node)
+            if not path:
+                raise Exception(f"No path to warehouse at node {wh_node}")
 
-        # Cool the temperature
-        temp *= cooling_rate
+            for node in path[1:]:
+                all_steps.append({
+                    'node_id': node,
+                    'pickups': [],
+                    'deliveries': [],
+                    'unloads': []
+                })
+            current_node = wh_node
 
-    # Return the *best found* tour, removing the start and end nodes
-    return best_solution[1:-1]
+        all_steps[-1]['pickups'].extend(pickup_actions)
+
+    # Execute deliveries
+    for dest_node, delivery_actions in deliveries_by_node.items():
+        if dest_node != current_node:
+            path = find_shortest_path(adj_list, current_node, dest_node)
+            if not path:
+                raise Exception(f"No path to destination at node {dest_node}")
+
+            for node in path[1:]:
+                all_steps.append({
+                    'node_id': node,
+                    'pickups': [],
+                    'deliveries': [],
+                    'unloads': []
+                })
+            current_node = dest_node
+
+        all_steps[-1]['deliveries'].extend(delivery_actions)
+
+    # Return to home warehouse
+    if current_node != vehicle_home_node:
+        path_home = find_shortest_path(adj_list, current_node, vehicle_home_node)
+        if not path_home:
+            raise Exception(f"No path back to home warehouse from node {current_node}")
+
+        for node in path_home[1:]:
+            all_steps.append({
+                'node_id': node,
+                'pickups': [],
+                'deliveries': [],
+                'unloads': []
+            })
+
+    return {
+        'vehicle_id': vehicle_id,
+        'steps': all_steps
+    }
 
 
-# -----------------------------------------------------------------
-# 3. MAIN SOLVER
-# -----------------------------------------------------------------
 def my_solver(env) -> Dict:
     """
-    Main solver function (Phase 11).
+    Main solver function for MWVRP.
+    Optimizes for cost minimization and high order fulfillment.
     """
     solution = {"routes": []}
-    print("---  Starting Phase 11 Solver (APSP + Simulated Annealing) ---")
 
-    # 1. Get Road Network Data and Pre-compute ALL paths
+    print("--- Starting Solver ---")
+
+    # Load road network
     try:
         road_network = env.get_road_network_data()
-        pre_calculate_all_paths(road_network.get("adjacency_list", {}))
+        adj_list = road_network.get("adjacency_list", {})
     except Exception as e:
-        print(f"ERROR during pre-computation: {e}")
+        print(f"Error loading road network: {e}")
         return solution
 
-    # 2. Get all orders and vehicles
+    # Initialize tracking
     unassigned_orders = set(env.get_all_order_ids())
     available_vehicles = env.get_available_vehicles()
-    local_inventory = {}
-    for wh_id, warehouse in env.warehouses.items():
-        local_inventory[wh_id] = warehouse.inventory.copy()
 
-    print(f"Total orders to serve: {len(unassigned_orders)}")
-    print(f"Total vehicles available: {len(available_vehicles)}")
+    # Create local inventory copy for tracking
+    local_inventory = {
+        wh_id: warehouse.inventory.copy()
+        for wh_id, warehouse in env.warehouses.items()
+    }
 
-    # 3. Loop through vehicles and try to build a "batch" for each
+    print(f"Total orders: {len(unassigned_orders)}")
+    print(f"Total vehicles: {len(available_vehicles)}")
+
+    # Process each vehicle
     for vehicle_id in available_vehicles:
-        if not unassigned_orders: break
+        if not unassigned_orders:
+            break
 
-        print(f"\nBuilding batch for Vehicle '{vehicle_id}'...")
+        print(f"\n=== Processing Vehicle: {vehicle_id} ===")
+
         vehicle = env.get_vehicle_by_id(vehicle_id)
-        home_node = env.get_vehicle_home_warehouse(vehicle_id)
+        vehicle_home_node = env.get_vehicle_home_warehouse(vehicle_id)
 
-        batch_items_to_pickup, batch_deliveries = [], []
-        current_weight, current_volume = 0, 0
-        orders_in_this_batch, batch_inventory_changes = set(), []
-
-        # --- SMART BATCHING (Sort by proximity) ---
-        order_distances = []
+        # Compute profiles for all unassigned orders
+        order_profiles = []
         for order_id in unassigned_orders:
-            try:
-                dest_node = env.get_order_location(order_id)
-                distance = get_dist_from_cache(home_node, dest_node)
-                if distance != float('inf'):
-                    order_distances.append((order_id, distance))
-            except Exception:
-                pass
-        sorted_orders = sorted(order_distances, key=lambda x: x[1])
+            profile = compute_order_profile(
+                env, order_id, local_inventory, adj_list, vehicle_home_node
+            )
+            if profile:
+                order_profiles.append(profile)
 
-        # --- Batching Loop (Now uses sorted list) ---
-        for order_id, distance in sorted_orders:
-            if order_id not in unassigned_orders: continue
-            try:
-                requirements = env.get_order_requirements(order_id)
-                dest_node = env.get_order_location(order_id)
-                order_weight, order_volume = 0, 0
-                items_for_this_order, order_inventory_changes = [], []
-                order_is_feasible = True
-
-                # --- Split-Inventory Logic (Untouched) ---
-                for sku_id, quantity_needed in requirements.items():
-                    sku_details = env.get_sku_details(sku_id)
-                    sku_weight, sku_volume = sku_details['weight'], sku_details['volume']
-                    quantity_found = 0
-                    for wh_id, inventory in local_inventory.items():
-                        if quantity_found == quantity_needed: break
-                        available_in_wh = inventory.get(sku_id, 0)
-                        if available_in_wh > 0:
-                            quantity_to_take = min(available_in_wh, quantity_needed - quantity_found)
-                            if quantity_to_take == 0: continue
-                            wh_node = env.get_warehouse_by_id(wh_id).location.id
-                            items_for_this_order.append((sku_id, quantity_to_take, wh_id, wh_node, dest_node))
-                            order_inventory_changes.append((wh_id, sku_id, quantity_to_take))
-                            quantity_found += quantity_to_take
-                            order_weight += sku_weight * quantity_to_take
-                            order_volume += sku_volume * quantity_to_take
-                    if quantity_found < quantity_needed:
-                        order_is_feasible = False
-                        break
-                # --- End Split-Inventory Logic ---
-
-                if not order_is_feasible: continue
-                if (current_weight + order_weight <= vehicle.capacity_weight and
-                        current_volume + order_volume <= vehicle.capacity_volume):
-                    current_weight += order_weight
-                    current_volume += order_volume
-                    orders_in_this_batch.add(order_id)
-                    for (sku_id, q, wh_id, wh_node, dest) in items_for_this_order:
-                        batch_items_to_pickup.append((sku_id, q, wh_id, wh_node))
-                    for sku_id, quantity in requirements.items():
-                        batch_deliveries.append((order_id, sku_id, quantity, dest_node))
-                    batch_inventory_changes.extend(order_inventory_changes)
-                    for (wh_id, sku_id, quantity) in order_inventory_changes:
-                        local_inventory[wh_id][sku_id] -= quantity
-                    unassigned_orders.remove(order_id)
-            except Exception as e:
-                pass
-        # --- END: Batching Loop ---
-
-        if not orders_in_this_batch:
-            print("  - No orders batched for this vehicle.")
+        if not order_profiles:
+            print("  No feasible orders for this vehicle")
             continue
 
-        print(f"  - Batch complete for '{vehicle_id}'. Building GLOBALLY OPTIMAL route...")
+        # Select optimal batch using knapsack approach
+        selected_orders = select_orders_knapsack(
+            vehicle, order_profiles, local_inventory
+        )
 
-        # 5. Find the paths between ALL stops
+        if not selected_orders:
+            print("  No orders selected after knapsack optimization")
+            continue
+
+        print(f"  Selected {len(selected_orders)} orders")
+
+        # Track inventory changes for potential rollback
+        inventory_changes = []
+        orders_in_batch = set()
+
+        # Reserve inventory for selected orders
+        for order in selected_orders:
+            wh_id = order['best_warehouse_id']
+
+            for sku_id, quantity in order['requirements'].items():
+                inventory_changes.append((wh_id, sku_id, quantity))
+                local_inventory[wh_id][sku_id] -= quantity
+
+            orders_in_batch.add(order['order_id'])
+            unassigned_orders.remove(order['order_id'])
+
+        # Build and validate route
         try:
-            all_steps = [{'node_id': home_node, 'pickups': [], 'deliveries': [], 'unloads': []}]
-            current_node = home_node
-            pickups_by_wh_node = {}
-            for (sku_id, q, wh_id, wh_node) in batch_items_to_pickup:
-                pickups_by_wh_node.setdefault(wh_node, []).append(
-                    {'warehouse_id': wh_id, 'sku_id': sku_id, 'quantity': q})
-            deliveries_by_dest_node = {}
-            for (order_id, sku_id, q, dest_node) in batch_deliveries:
-                deliveries_by_dest_node.setdefault(dest_node, []).append(
-                    {'order_id': order_id, 'sku_id': sku_id, 'quantity': q})
+            route = build_route_for_batch(
+                env, vehicle_id, selected_orders, adj_list
+            )
 
-            # --- GLOBALLY OPTIMIZED ROUTING (NN + SA) ---
-            pickup_nodes_to_visit = set(pickups_by_wh_node.keys())
-            delivery_nodes_to_visit = set(deliveries_by_dest_node.keys())
+            # Verify route structure before adding
+            if not route or 'vehicle_id' not in route or 'steps' not in route:
+                raise Exception("Invalid route structure")
 
-            # --- Phase 1: Build Pickup Route (Fast NN) ---
-            nn_pickup_route = []
-            temp_current_node = current_node
-            while pickup_nodes_to_visit:
-                nearest_wh_node = find_nearest_node_fast(temp_current_node, pickup_nodes_to_visit)
-                if nearest_wh_node is None: raise Exception(
-                    "Routing Error: Cannot find path to any remaining pickup warehouse.")
-                nn_pickup_route.append(nearest_wh_node)
-                temp_current_node = nearest_wh_node
-                pickup_nodes_to_visit.remove(nearest_wh_node)
+            if not route['steps'] or len(route['steps']) == 0:
+                raise Exception("Route has no steps")
 
-            # --- Phase 2: Optimize Pickup Route (Simulated Annealing) ---
-            print("    - Optimizing pickup route with Simulated Annealing...")
-            optimized_pickup_route = optimize_route_simulated_annealing(current_node, nn_pickup_route, current_node)
+            # Verify first and last steps are at home warehouse
+            home_node = env.get_vehicle_home_warehouse(vehicle_id)
+            if route['steps'][0]['node_id'] != home_node:
+                raise Exception(f"Route doesn't start at home warehouse")
+            if route['steps'][-1]['node_id'] != home_node:
+                raise Exception(f"Route doesn't end at home warehouse")
 
-            # --- Phase 3: Build Delivery Route (Fast NN) ---
-            temp_current_node = optimized_pickup_route[-1] if optimized_pickup_route else current_node
-            nn_delivery_route = []
-            while delivery_nodes_to_visit:
-                nearest_dest_node = find_nearest_node_fast(temp_current_node, delivery_nodes_to_visit)
-                if nearest_dest_node is None: raise Exception(
-                    "Routing Error: Cannot find path to any remaining customer.")
-                nn_delivery_route.append(nearest_dest_node)
-                temp_current_node = nearest_dest_node
-                delivery_nodes_to_visit.remove(nearest_dest_node)
-
-            # --- Phase 4: Optimize Delivery Route (Simulated Annealing) ---
-            print("    - Optimizing delivery route with Simulated Annealing...")
-            start_of_delivery = optimized_pickup_route[-1] if optimized_pickup_route else home_node
-            optimized_delivery_route = optimize_route_simulated_annealing(start_of_delivery, nn_delivery_route,
-                                                                          home_node)
-
-            # --- Phase 5: Build Final `all_steps` from Optimized Routes ---
-            print("    - Building final optimized step list...")
-            for wh_node in optimized_pickup_route:
-                path = get_path_from_cache(current_node, wh_node)
-                if not path: raise Exception(f"No path to warehouse node {wh_node}")
-                for node in path[1:]: all_steps.append(
-                    {'node_id': node, 'pickups': [], 'deliveries': [], 'unloads': []})
-                current_node = wh_node
-                all_steps[-1]['pickups'].extend(pickups_by_wh_node[wh_node])
-            for dest_node in optimized_delivery_route:
-                path = get_path_from_cache(current_node, dest_node)
-                if not path: raise Exception(f"No path to customer node {dest_node}")
-                for node in path[1:]: all_steps.append(
-                    {'node_id': node, 'pickups': [], 'deliveries': [], 'unloads': []})
-                current_node = dest_node
-                all_steps[-1]['deliveries'].extend(deliveries_by_dest_node[dest_node])
-
-            # --- Phase 6: Return Home ---
-            if home_node != current_node:
-                path_to_home = get_path_from_cache(current_node, home_node)
-                if not path_to_home: raise Exception(f"No path back home from {current_node}")
-                for node in path_to_home[1:]: all_steps.append(
-                    {'node_id': node, 'pickups': [], 'deliveries': [], 'unloads': []})
-
-            solution['routes'].append({'vehicle_id': vehicle_id, 'steps': all_steps})
-            print(f"  - SUCCESS: Globally Optimal Route created for batch with {len(all_steps)} steps.")
+            solution['routes'].append(route)
+            print(f"   Route created with {len(route['steps'])} steps")
 
         except Exception as e:
-            print(f"  - ERROR: Could not build route for batch: {e}")
-            print(f"  - Re-assigning {len(orders_in_this_batch)} orders.")
-            unassigned_orders.update(orders_in_this_batch)
-            for (wh_id, sku_id, quantity) in batch_inventory_changes:
-                local_inventory[wh_id][sku_id] = local_inventory[wh_id].get(sku_id, 0) + quantity
+            # Route construction failed - rollback
+            print(f"  ✗ Route construction failed: {e}")
+            unassigned_orders.update(orders_in_batch)
 
-    print(f"\n---  Phase 11 Finished ---")
-    print(f"Total routes created: {len(solution['routes'])}")
-    print(f"Orders left unassigned: {len(unassigned_orders)}")
+            for (wh_id, sku_id, quantity) in inventory_changes:
+                if sku_id in local_inventory[wh_id]:
+                    local_inventory[wh_id][sku_id] += quantity
+                else:
+                    local_inventory[wh_id][sku_id] = quantity
+
+    print(f"\n--- Solver Complete ---")
+    print(f"Routes created: {len(solution['routes'])}")
+    print(f"Unassigned orders: {len(unassigned_orders)}")
+
     return solution
 
