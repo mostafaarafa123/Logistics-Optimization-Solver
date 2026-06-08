@@ -1,5 +1,7 @@
+
+
 from robin_logistics import LogisticsEnvironment
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 
 
 def find_shortest_path(adj_list: Dict[int, List[int]], start_node: int, end_node: int) -> Optional[List[int]]:
@@ -37,53 +39,15 @@ def find_shortest_path(adj_list: Dict[int, List[int]], start_node: int, end_node
     return None  # No path was found
 
 
-def find_nearest_node(adj_list: Dict[int, List[int]],
-                      current_node: int,
-                      target_nodes: Set[int]) -> Optional[int]:
-    """
-    Finds the node in target_nodes that is closest to current_node.
-    Uses BFS to find the shortest path to *any* target.
-    """
-    if not target_nodes:
-        return None
-
-    if current_node in target_nodes:
-        return current_node
-
-    queue: List = [(current_node, [current_node])]
-    visited = {current_node}
-
-    while queue:
-        (node, path) = queue.pop(0)
-
-        if node not in adj_list:
-            continue
-
-        for neighbor in adj_list[node]:
-            if neighbor not in visited:
-                visited.add(neighbor)
-
-                # Check if this neighbor is one of our targets
-                if neighbor in target_nodes:
-                    return neighbor  # Found the nearest target
-
-                queue.append((neighbor, path + [neighbor]))
-
-    return None  # No path found to any target
-
-
 def my_solver(env) -> Dict:
     """
     Main solver function.
-    PHASE 9: Implements:
-    1. Split-Inventory (for 100% fulfillment)
-    2. Smart Batching (Sort orders by proximity to home)
-    3. Optimal Routing (Nearest Neighbor for pickups, then Nearest Neighbor for deliveries)
+    PHASE 7: Fixing the inventory revert logic on routing failure.
     """
 
     solution = {"routes": []}
 
-    print("---  Starting Phase 9 Solver (NN Routing + Smart Batching) ---")
+    print("---  Starting Phase 7 Solver (Bug Fix) ---")
 
     # 1. Get Road Network Data
     try:
@@ -96,7 +60,6 @@ def my_solver(env) -> Dict:
     unassigned_orders = set(env.get_all_order_ids())
     available_vehicles = env.get_available_vehicles()
 
-    # Create a *local copy* of the inventory to track changes
     local_inventory = {}
     for wh_id, warehouse in env.warehouses.items():
         local_inventory[wh_id] = warehouse.inventory.copy()
@@ -112,7 +75,6 @@ def my_solver(env) -> Dict:
 
         print(f"\nBuilding batch for Vehicle '{vehicle_id}'...")
         vehicle = env.get_vehicle_by_id(vehicle_id)
-        home_node = env.get_vehicle_home_warehouse(vehicle_id)
 
         batch_items_to_pickup = []
         batch_deliveries = []
@@ -121,34 +83,12 @@ def my_solver(env) -> Dict:
         current_volume = 0
         orders_in_this_batch = set()
 
+        # --- FIX #1: Create a master list for *all* inventory changes in this batch ---
         batch_inventory_changes = []
+        # --- END FIX #1 ---
 
-        # --- IMPROVEMENT 1: SMART BATCHING ---
-        # Sort unassigned orders by distance from the vehicle's home to the customer
-        # This helps create geographically clustered batches.
-
-        order_distances = []
-        for order_id in unassigned_orders:
-            try:
-                dest_node = env.get_order_location(order_id)
-                path = find_shortest_path(adj_list, home_node, dest_node)
-                distance = len(path) - 1 if path else float('inf')
-                if distance != float('inf'):
-                    order_distances.append((order_id, distance))
-            except Exception:
-                pass  # Order might be invalid
-
-        # Sort by distance (ascending)
-        sorted_orders = sorted(order_distances, key=lambda x: x[1])
-
-        print(f"  - Analyzing {len(sorted_orders)} reachable orders for batching...")
-
-        # --- Batching Loop (Now uses sorted list) ---
-        for order_id, distance in sorted_orders:
-
-            # The order might have been assigned to another vehicle in the meantime
-            if order_id not in unassigned_orders:
-                continue
+        # --- Batching Loop ---
+        for order_id in list(unassigned_orders):
 
             try:
                 requirements = env.get_order_requirements(order_id)
@@ -157,44 +97,37 @@ def my_solver(env) -> Dict:
                 order_weight = 0
                 order_volume = 0
                 items_for_this_order = []
-                order_inventory_changes = []
+
                 order_is_feasible = True
 
-                # --- Split-Inventory Logic (from Phase 8) ---
-                for sku_id, quantity_needed in requirements.items():
-                    sku_details = env.get_sku_details(sku_id)
-                    sku_weight = sku_details['weight']
-                    sku_volume = sku_details['volume']
-                    quantity_found = 0
+                # --- FIX #2: Create a *temporary* list for *this order only* ---
+                order_inventory_changes = []
+                # --- END FIX #2 ---
 
+                for sku_id, quantity in requirements.items():
+                    sku_details = env.get_sku_details(sku_id)
+                    order_weight += sku_details['weight'] * quantity
+                    order_volume += sku_details['volume'] * quantity
+
+                    found_warehouse = False
                     for wh_id, inventory in local_inventory.items():
-                        if quantity_found == quantity_needed:
+                        if inventory.get(sku_id, 0) >= quantity:
+                            warehouse_node = env.get_warehouse_by_id(wh_id).location.id
+                            items_for_this_order.append((sku_id, quantity, wh_id, warehouse_node, dest_node))
+
+                            # Add change to the *order's* temp list
+                            order_inventory_changes.append((wh_id, sku_id, quantity))
+                            found_warehouse = True
                             break
 
-                        available_in_wh = inventory.get(sku_id, 0)
-
-                        if available_in_wh > 0:
-                            quantity_to_take = min(available_in_wh, quantity_needed - quantity_found)
-                            if quantity_to_take == 0: continue
-
-                            wh_node = env.get_warehouse_by_id(wh_id).location.id
-                            items_for_this_order.append((sku_id, quantity_to_take, wh_id, wh_node, dest_node))
-                            order_inventory_changes.append((wh_id, sku_id, quantity_to_take))
-
-                            quantity_found += quantity_to_take
-                            order_weight += sku_weight * quantity_to_take
-                            order_volume += sku_volume * quantity_to_take
-
-                    if quantity_found < quantity_needed:
+                    if not found_warehouse:
                         order_is_feasible = False
-                        # Note: We don't print failure here, as it's too noisy
                         break
-                        # --- End Split-Inventory Logic ---
 
                 if not order_is_feasible:
                     continue
 
-                # Check capacity
+                    # Check capacity
                 if (current_weight + order_weight <= vehicle.capacity_weight and
                         current_volume + order_volume <= vehicle.capacity_volume):
 
@@ -205,12 +138,16 @@ def my_solver(env) -> Dict:
 
                     for (sku_id, q, wh_id, wh_node, dest) in items_for_this_order:
                         batch_items_to_pickup.append((sku_id, q, wh_id, wh_node))
-                    for sku_id, quantity in requirements.items():
-                        batch_deliveries.append((order_id, sku_id, quantity, dest_node))
+                        batch_deliveries.append((order_id, sku_id, q, dest))
 
+                    # --- Apply and Store inventory changes ---
+                    # Add this order's changes to the master *batch* list
                     batch_inventory_changes.extend(order_inventory_changes)
+
+                    # Apply changes to local inventory
                     for (wh_id, sku_id, quantity) in order_inventory_changes:
                         local_inventory[wh_id][sku_id] -= quantity
+                    # --- END Apply and Store ---
 
                     unassigned_orders.remove(order_id)
 
@@ -222,15 +159,14 @@ def my_solver(env) -> Dict:
             print("  - No orders batched for this vehicle.")
             continue
 
-        print(
-            f"  - Batch complete for '{vehicle_id}'. Building OPTIMAL route for {len(orders_in_this_batch)} orders...")
+        print(f"  - Batch complete for '{vehicle_id}'. Building route for {len(orders_in_this_batch)} orders...")
 
-        # 5. Find the paths between ALL stops
+        # 5. Find the paths between ALL stops (Logic remains the same)
         try:
+            home_node = env.get_vehicle_home_warehouse(vehicle_id)
             all_steps = [{'node_id': home_node, 'pickups': [], 'deliveries': [], 'unloads': []}]
             current_node = home_node
 
-            # Group pickups by warehouse node
             pickups_by_wh_node = {}
             for (sku_id, quantity, warehouse_id, warehouse_node) in batch_items_to_pickup:
                 if warehouse_node not in pickups_by_wh_node:
@@ -239,7 +175,6 @@ def my_solver(env) -> Dict:
                     {'warehouse_id': warehouse_id, 'sku_id': sku_id, 'quantity': quantity}
                 )
 
-            # Group deliveries by destination node
             deliveries_by_dest_node = {}
             for (order_id, sku_id, quantity, dest_node) in batch_deliveries:
                 if dest_node not in deliveries_by_dest_node:
@@ -248,56 +183,26 @@ def my_solver(env) -> Dict:
                     {'order_id': order_id, 'sku_id': sku_id, 'quantity': quantity}
                 )
 
-            # --- IMPROVEMENT 2: OPTIMAL ROUTING (NEAREST NEIGHBOR) ---
-
-            pickup_nodes_to_visit = set(pickups_by_wh_node.keys())
-            delivery_nodes_to_visit = set(deliveries_by_dest_node.keys())
-
-            # --- Phase 1: Pickups (Nearest Neighbor) ---
-            print(f"    - Routing: Finding nearest pickups...")
-            while pickup_nodes_to_visit:
-                # Find the *closest* warehouse that still needs to be visited
-                nearest_wh_node = find_nearest_node(adj_list, current_node, pickup_nodes_to_visit)
-
-                if nearest_wh_node is None:
-                    raise Exception("Routing Error: Cannot find path to any remaining pickup warehouse.")
-
-                if nearest_wh_node != current_node:
-                    path = find_shortest_path(adj_list, current_node, nearest_wh_node)
+            for wh_node, pickup_actions in pickups_by_wh_node.items():
+                if wh_node != current_node:
+                    path = find_shortest_path(adj_list, current_node, wh_node)
                     if not path:
-                        raise Exception(f"No path to warehouse node {nearest_wh_node}")
+                        raise Exception(f"No path to warehouse node {wh_node}")
                     for node in path[1:]:
                         all_steps.append({'node_id': node, 'pickups': [], 'deliveries': [], 'unloads': []})
-                    current_node = nearest_wh_node
+                    current_node = wh_node
+                all_steps[-1]['pickups'].extend(pickup_actions)
 
-                # Perform all pickups at this (now current) node
-                all_steps[-1]['pickups'].extend(pickups_by_wh_node[nearest_wh_node])
-                pickup_nodes_to_visit.remove(nearest_wh_node)
-
-            # --- Phase 2: Deliveries (Nearest Neighbor) ---
-            print(f"    - Routing: Finding nearest deliveries...")
-            while delivery_nodes_to_visit:
-                # Find the *closest* customer that still needs to be visited
-                nearest_dest_node = find_nearest_node(adj_list, current_node, delivery_nodes_to_visit)
-
-                if nearest_dest_node is None:
-                    raise Exception("Routing Error: Cannot find path to any remaining customer.")
-
-                if nearest_dest_node != current_node:
-                    path = find_shortest_path(adj_list, current_node, nearest_dest_node)
+            for dest_node, delivery_actions in deliveries_by_dest_node.items():
+                if dest_node != current_node:
+                    path = find_shortest_path(adj_list, current_node, dest_node)
                     if not path:
-                        raise Exception(f"No path to customer node {nearest_dest_node}")
+                        raise Exception(f"No path to customer node {dest_node}")
                     for node in path[1:]:
                         all_steps.append({'node_id': node, 'pickups': [], 'deliveries': [], 'unloads': []})
-                    current_node = nearest_dest_node
+                    current_node = dest_node
+                all_steps[-1]['deliveries'].extend(delivery_actions)
 
-                # Perform all deliveries at this (now current) node
-                all_steps[-1]['deliveries'].extend(deliveries_by_dest_node[nearest_dest_node])
-                delivery_nodes_to_visit.remove(nearest_dest_node)
-
-            # --- END: OPTIMAL ROUTING LOGIC ---
-
-            # --- Phase 3: Return Home ---
             if home_node != current_node:
                 path_to_home = find_shortest_path(adj_list, current_node, home_node)
                 if not path_to_home:
@@ -313,19 +218,19 @@ def my_solver(env) -> Dict:
             print(f"  - SUCCESS: Route created for batch with {len(all_steps)} steps.")
 
         except Exception as e:
-            # Routing failed, revert all changes for this batch
             print(f"  - ERROR: Could not build route for batch: {e}")
             print(f"  - Re-assigning {len(orders_in_this_batch)} orders.")
             unassigned_orders.update(orders_in_this_batch)
 
-            # Revert inventory
+            # --- FIX #3: Revert inventory using the MASTER batch list ---
             for (wh_id, sku_id, quantity) in batch_inventory_changes:
                 if sku_id in local_inventory[wh_id]:
                     local_inventory[wh_id][sku_id] += quantity
                 else:
-                    local_inventory[wh_id][sku_id] = quantity
+                    local_inventory[wh_id][sku_id] = quantity  # (Just in case)
+            # --- END FIX #3 ---
 
-    print(f"\n---  Phase 9 Finished ---")
+    print(f"\n---  Phase 7 Finished ---")
     print(f"Total routes created: {len(solution['routes'])}")
     print(f"Orders left unassigned: {len(unassigned_orders)}")
 
